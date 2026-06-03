@@ -4404,15 +4404,31 @@ void fetchWeather() {
 }
 
 // Weather page (drawn into the global sprite, which the caller pushes).
+// Layout: big temperature number + a hand-drawn degree ring + "C", since the
+// GLCD font 1 doesn't render '°' reliably.
 void drawWeatherScreen() {
     char tstr[8];
     snprintf(tstr, sizeof(tstr), "%.0f", weatherTemp);
-    String temp = String(tstr) + "\xB0";  // degree sign
     sprite.setTextFont(1);
-    sprite.setTextColor(AMBER, BG_COLOR);
+
     sprite.setTextSize(7);
-    int w = sprite.textWidth(temp);
-    drawGlowText(sprite, (SCREEN_W - w) / 2, 35, temp);
+    int numW = sprite.textWidth(tstr);
+    sprite.setTextSize(4);
+    int cW   = sprite.textWidth("C");
+    const int ringR = 6, gap1 = 10, gap2 = 6;
+    int totalW = numW + gap1 + ringR * 2 + gap2 + cW;
+    int x = (SCREEN_W - totalW) / 2;
+
+    sprite.setTextSize(7);
+    drawGlowText(sprite, x, 35, String(tstr));
+
+    int sx = x + numW + gap1;
+    sprite.drawCircle(sx + ringR, 45, ringR, AMBER);
+    sprite.drawCircle(sx + ringR, 45, ringR - 1, AMBER);
+    sprite.setTextSize(4);
+    sprite.setTextColor(AMBER, BG_COLOR);
+    sprite.setCursor(sx + ringR * 2 + gap2, 45);
+    sprite.print("C");
 
     const char* cond = weatherText(weatherCode);
     sprite.setTextSize(2);
@@ -5016,7 +5032,10 @@ void maybeEnterDeepSleep() {
 
     logf("Deep sleep for %ld s (until %02d:00)\n", delta, sTo);
 
-    // Brief on-device notice so it's clear what happened.
+    // Brief on-device notice so it's clear what happened. Wake the panel first —
+    // applyPowerSchedule() may have already put it to sleep on entering standby.
+    panelWake();
+    standbyActive = false;
     sprite.createSprite(SCREEN_W, SCREEN_H);
     sprite.fillSprite(BG_COLOR);
     sprite.setTextFont(1);
