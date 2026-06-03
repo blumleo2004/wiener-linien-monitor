@@ -12,6 +12,7 @@
 #include <WiFiManager.h>
 #include <HTTPUpdate.h>
 #include <esp_system.h>
+#include <esp_sleep.h>
 #include <vector>
 #include <map>
 #include <algorithm>
@@ -98,7 +99,7 @@ void saveCrashInfo() {
 }
 
 // ── Firmware version ────────────────────────────────────────────────
-#define FW_VERSION "1.6.1"
+#define FW_VERSION "1.7.0"
 #define OTA_VERSION_URL      "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version.json"
 #define OTA_VERSION_URL_BETA "https://raw.githubusercontent.com/blumleo2004/linetracker/master/version-beta.json"
 static const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60 * 60 * 1000; // 6h
@@ -334,9 +335,20 @@ static int  cfgBrightness     = 255;   // backlight 0-255 (default max)
 static int  cfgNightFrom      = -1;    // night mode start hour (0-23), -1 = disabled
 static int  cfgNightTo        = -1;    // night mode end hour (0-23)
 static int  cfgNightBright    = 20;    // backlight during night mode
+// Standby / sleep: display fully off (backlight + panel sleep) during a window.
+static int  cfgStandbyFrom     = -1;    // standby start hour (0-23), -1 = disabled
+static int  cfgStandbyTo       = -1;    // standby end hour (0-23)
+static bool cfgStandbyDeepSleep = false; // EXPERIMENTAL: ESP32 deep sleep (timer wakeup) instead of panel sleep
+// Weekend schedule: separate night/standby windows for Sat/Sun when enabled.
+static bool cfgWeekendSchedule = false;
+static int  cfgNightFromWe     = -1;
+static int  cfgNightToWe       = -1;
+static int  cfgStandbyFromWe   = -1;
+static int  cfgStandbyToWe     = -1;
 static bool   cfgShowNext        = false; // show next departure below main countdown
 static bool   cfgShowDisruptions = false; // show WL disruption ticker at bottom
 static bool   cfgShowClock        = false; // show a clock as its own page in the rotation
+static bool   cfgShowWeather      = false; // show a weather page (Vienna, Open-Meteo) in the rotation
 static bool   cfgLineColors       = false; // tint U-Bahn lines in official colors (default off = amber FIS)
 static bool   cfgSortByTime      = true;  // sort display slots by countdown
 static bool   cfgBetaChannel     = false; // pull OTA updates from the beta channel (version-beta.json)
@@ -452,9 +464,18 @@ bool loadConfig() {
     cfgNightFrom       = doc["night_from"]        | -1;
     cfgNightTo         = doc["night_to"]          | -1;
     cfgNightBright     = doc["night_bright"]      | 20;
+    cfgStandbyFrom     = doc["standby_from"]      | -1;
+    cfgStandbyTo       = doc["standby_to"]        | -1;
+    cfgStandbyDeepSleep = doc["standby_deep"]     | false;
+    cfgWeekendSchedule = doc["weekend_sched"]     | false;
+    cfgNightFromWe     = doc["night_from_we"]     | -1;
+    cfgNightToWe       = doc["night_to_we"]       | -1;
+    cfgStandbyFromWe   = doc["standby_from_we"]   | -1;
+    cfgStandbyToWe     = doc["standby_to_we"]     | -1;
     cfgShowNext        = doc["show_next"]         | false;
     cfgShowDisruptions = doc["show_disruptions"]  | false;
     cfgShowClock       = doc["show_clock"]        | false;
+    cfgShowWeather     = doc["show_weather"]      | false;
     cfgLineColors      = doc["line_colors"]       | false;
     cfgSortByTime      = doc["sort_by_time"]      | true;
     cfgBetaChannel     = doc["beta_channel"]      | false;
@@ -512,9 +533,18 @@ void saveConfig() {
     doc["night_from"]       = cfgNightFrom;
     doc["night_to"]         = cfgNightTo;
     doc["night_bright"]     = cfgNightBright;
+    doc["standby_from"]     = cfgStandbyFrom;
+    doc["standby_to"]       = cfgStandbyTo;
+    doc["standby_deep"]     = cfgStandbyDeepSleep;
+    doc["weekend_sched"]    = cfgWeekendSchedule;
+    doc["night_from_we"]    = cfgNightFromWe;
+    doc["night_to_we"]      = cfgNightToWe;
+    doc["standby_from_we"]  = cfgStandbyFromWe;
+    doc["standby_to_we"]    = cfgStandbyToWe;
     doc["show_next"]        = cfgShowNext;
     doc["show_disruptions"] = cfgShowDisruptions;
     doc["show_clock"]       = cfgShowClock;
+    doc["show_weather"]     = cfgShowWeather;
     doc["line_colors"]      = cfgLineColors;
     doc["sort_by_time"]     = cfgSortByTime;
     doc["beta_channel"]     = cfgBetaChannel;
@@ -1225,6 +1255,51 @@ void handleSettingsPage() {
         html += "</div>";
     }
 
+    // ── Standby (display fully off) ──
+    {
+        String sbFromVal = (cfgStandbyFrom >= 0) ? String(cfgStandbyFrom) : "0";
+        String sbToVal   = (cfgStandbyTo   >= 0) ? String(cfgStandbyTo)   : "6";
+        bool sbOn = (cfgStandbyFrom >= 0);
+        html += "<div class='setting'>";
+        html += "<label class='check-label'><input type='checkbox' name='standby_on' value='1' id='cb_sb'";
+        if (sbOn) html += " checked";
+        html += " onchange=\"document.getElementById('sb_opts').style.display=this.checked?'block':'none'\">Standby &ndash; Display ganz aus</label></div>";
+        html += "<div id='sb_opts' style='display:" + String(sbOn ? "block" : "none") + "'>";
+        html += "<div class='time-row'><span>Von</span><input type='number' name='standby_from' min='0' max='23' value='" + sbFromVal + "'>";
+        html += "<span>bis</span><input type='number' name='standby_to' min='0' max='23' value='" + sbToVal + "'><span>Uhr</span></div>";
+        // Deep sleep (experimental) — requires explicit risk confirmation
+        html += "<label class='check-label' style='margin-top:8px'><input type='checkbox' name='standby_deep' value='1' id='cb_deep'";
+        if (cfgStandbyDeepSleep) html += " checked";
+        html += " onchange=\"document.getElementById('deep_warn').style.display=this.checked?'block':'none'\">Deep Sleep (experimentell)</label>";
+        html += "<div id='deep_warn' style='display:" + String(cfgStandbyDeepSleep ? "block" : "none") + ";background:#3a1212;border:1px solid #a33;border-radius:8px;padding:10px;margin-top:6px'>";
+        html += "<p style='color:#f99;font-size:12px;margin:0 0 8px'><b>Achtung:</b> Im Deep Sleep ist das Ger&auml;t NICHT per WLAN/Web erreichbar, bis das Zeitfenster endet. Bei falscher Zeit oder Konfiguration kann das Display unerreichbar bleiben &ndash; im Notfall ist ein Laptop zum Neu-Flashen n&ouml;tig. Nur f&uuml;r erfahrene Nutzer.</p>";
+        html += "<label class='check-label' style='color:#f99'><input type='checkbox' name='standby_deep_ack' value='1'";
+        if (cfgStandbyDeepSleep) html += " checked";
+        html += ">Ich verstehe das Risiko</label></div>";
+        html += "</div>";
+    }
+
+    // ── Weekend schedule (separate night/standby for Sat/Sun) ──
+    {
+        bool weOn = cfgWeekendSchedule;
+        String wnFrom = (cfgNightFromWe   >= 0) ? String(cfgNightFromWe)   : "23";
+        String wnTo   = (cfgNightToWe     >= 0) ? String(cfgNightToWe)     : "9";
+        String wsFrom = (cfgStandbyFromWe >= 0) ? String(cfgStandbyFromWe) : "0";
+        String wsTo   = (cfgStandbyToWe   >= 0) ? String(cfgStandbyToWe)   : "9";
+        html += "<div class='setting'>";
+        html += "<label class='check-label'><input type='checkbox' name='weekend_sched' value='1' id='cb_we'";
+        if (weOn) html += " checked";
+        html += " onchange=\"document.getElementById('we_opts').style.display=this.checked?'block':'none'\">Eigener Wochenend-Zeitplan (Sa/So)</label></div>";
+        html += "<div id='we_opts' style='display:" + String(weOn ? "block" : "none") + "'>";
+        html += "<p class='hint' style='margin:4px 0'>Nachtmodus Sa/So</p>";
+        html += "<div class='time-row'><span>Von</span><input type='number' name='night_from_we' min='0' max='23' value='" + wnFrom + "'>";
+        html += "<span>bis</span><input type='number' name='night_to_we' min='0' max='23' value='" + wnTo + "'><span>Uhr</span></div>";
+        html += "<p class='hint' style='margin:4px 0'>Standby Sa/So</p>";
+        html += "<div class='time-row'><span>Von</span><input type='number' name='standby_from_we' min='0' max='23' value='" + wsFrom + "'>";
+        html += "<span>bis</span><input type='number' name='standby_to_we' min='0' max='23' value='" + wsTo + "'><span>Uhr</span></div>";
+        html += "</div>";
+    }
+
     html += "<div class='options-col'>";
     html += "<label class='check-label'><input type='checkbox' name='show_next' value='1'";
     if (cfgShowNext) html += " checked";
@@ -1235,6 +1310,9 @@ void handleSettingsPage() {
     html += "<label class='check-label'><input type='checkbox' name='show_clock' value='1'";
     if (cfgShowClock) html += " checked";
     html += ">Uhr als eigene Seite anzeigen</label>";
+    html += "<label class='check-label'><input type='checkbox' name='show_weather' value='1'";
+    if (cfgShowWeather) html += " checked";
+    html += ">Wetter als eigene Seite anzeigen</label>";
     html += "<label class='check-label'><input type='checkbox' name='line_colors' value='1'";
     if (cfgLineColors) html += " checked";
     html += ">U-Bahn-Linienfarben</label>";
@@ -1751,9 +1829,12 @@ void handleApiNow() {
 
 // Forward declarations
 std::vector<Departure> fetchOebbStation(const String& stationName, int nowMin);
-void applyNightMode();
+void applyPowerSchedule();
+void maybeEnterDeepSleep();
 String sanitize(String s);
 extern bool lastNightState;
+extern volatile bool standbyActive;  // true while the display panel is in sleep (standby window)
+extern volatile bool powerDirty;     // set when config changes → displayTask re-evaluates power state
 
 // Search ÖBB for station name, returns canonical name or empty string
 String searchOebbStation(const String& query) {
@@ -2233,28 +2314,37 @@ void handleSettings() {
         cfgNightFrom = -1;
         cfgNightTo   = -1;
     }
+    // Standby / sleep (display fully off)
+    bool standbyOn = server.hasArg("standby_on");
+    if (standbyOn) {
+        cfgStandbyFrom = server.arg("standby_from").toInt();
+        cfgStandbyTo   = server.arg("standby_to").toInt();
+        // Deep sleep is experimental and only accepted with explicit risk confirmation.
+        cfgStandbyDeepSleep = server.hasArg("standby_deep") && server.hasArg("standby_deep_ack");
+    } else {
+        cfgStandbyFrom = -1;
+        cfgStandbyTo   = -1;
+        cfgStandbyDeepSleep = false;
+    }
+    // Weekend schedule (separate night/standby windows for Sat/Sun)
+    cfgWeekendSchedule = server.hasArg("weekend_sched");
+    if (cfgWeekendSchedule) {
+        cfgNightFromWe   = server.hasArg("night_from_we")   ? server.arg("night_from_we").toInt()   : -1;
+        cfgNightToWe     = server.hasArg("night_to_we")     ? server.arg("night_to_we").toInt()     : -1;
+        cfgStandbyFromWe = server.hasArg("standby_from_we") ? server.arg("standby_from_we").toInt() : -1;
+        cfgStandbyToWe   = server.hasArg("standby_to_we")   ? server.arg("standby_to_we").toInt()   : -1;
+    }
     cfgShowNext        = server.hasArg("show_next");
     cfgShowDisruptions = server.hasArg("show_disruptions");
     cfgShowClock       = server.hasArg("show_clock");
+    cfgShowWeather     = server.hasArg("show_weather");
     cfgLineColors      = server.hasArg("line_colors");
     cfgSortByTime      = server.hasArg("sort_by_time");
     cfgBetaChannel     = server.hasArg("beta_channel");
 
-    // Apply brightness immediately
-    if (cfgNightFrom >= 0 && cfgNightTo >= 0) {
-        struct tm ti;
-        if (getLocalTime(&ti, 0)) {
-            int h = ti.tm_hour;
-            bool isNight;
-            if (cfgNightFrom <= cfgNightTo) isNight = (h >= cfgNightFrom && h < cfgNightTo);
-            else isNight = (h >= cfgNightFrom || h < cfgNightTo);
-            ledcWrite(0, isNight ? cfgNightBright : cfgBrightness);
-            lastNightState = isNight;
-        }
-    } else {
-        ledcWrite(0, cfgBrightness);
-        lastNightState = false;
-    }
+    // Let displayTask re-evaluate backlight/panel state on its next tick
+    // (panel SPI commands must not run from the web-server task).
+    powerDirty = true;
 
     saveConfig();
     server.sendHeader("Location", "/?saved=1");
@@ -3237,6 +3327,22 @@ static std::vector<Departure> buildSlots(const std::vector<Departure>& deps) {
     if (cfgSortByTime) {
         std::sort(slots.begin(), slots.end(),
             [](const Departure& a, const Departure& b){ return a.countdown < b.countdown; });
+    } else {
+        // Manual order: follow the configured order (cfgLines, then cfgOebb),
+        // watch groups grouped by their index. deps is already countdown-sorted,
+        // so stable_sort keeps the soonest departure first within equal ranks.
+        auto rankOf = [](const Departure& d) -> int {
+            if (d.watchIdx >= 0) return 1000000 + d.watchIdx * 1000;
+            for (size_t i = 0; i < cfgLines.size(); i++)
+                if (cfgLines[i].name == d.lineName && cfgLines[i].towards == d.towards)
+                    return (int)i;
+            for (size_t j = 0; j < cfgOebb.size(); j++)
+                if (cfgOebb[j].line == d.lineName && cfgOebb[j].towards == d.towards)
+                    return 100000 + (int)j;
+            return 900000; // unknown → before watch groups, after configured lines
+        };
+        std::stable_sort(slots.begin(), slots.end(),
+            [&](const Departure& a, const Departure& b){ return rankOf(a) < rankOf(b); });
     }
     return slots;
 }
@@ -4252,7 +4358,79 @@ void drawClockScreen(const struct tm& ti) {
     sprite.print(datestr);
 }
 
+// ── Weather (Vienna, Open-Meteo, no API key) ─────────────────────────
+static float weatherTemp  = 0;
+static int   weatherCode  = -1;
+static bool  weatherValid = false;
+static unsigned long lastWeatherFetch = 0;
+static const unsigned long WEATHER_INTERVAL_MS = 15UL * 60 * 1000; // 15 min
+
+// WMO weather code → short German label.
+static const char* weatherText(int code) {
+    if (code == 0)                   return "Klar";
+    if (code >= 1 && code <= 3)      return "Bewoelkt";
+    if (code == 45 || code == 48)    return "Nebel";
+    if (code >= 51 && code <= 57)    return "Nieselregen";
+    if (code >= 61 && code <= 67)    return "Regen";
+    if (code >= 71 && code <= 77)    return "Schnee";
+    if (code >= 80 && code <= 82)    return "Schauer";
+    if (code == 85 || code == 86)    return "Schneeschauer";
+    if (code >= 95)                  return "Gewitter";
+    return "";
+}
+
+void fetchWeather() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.begin(client,
+        "https://api.open-meteo.com/v1/forecast?latitude=48.21&longitude=16.37"
+        "&current=temperature_2m,weather_code&timezone=Europe%2FVienna");
+    http.setTimeout(15000);
+    int code = http.GET();
+    if (code != 200) { http.end(); return; }
+    String payload = http.getString();
+    http.end();
+
+    JsonDocument doc;
+    if (deserializeJson(doc, payload)) return;
+    if (!doc["current"]["temperature_2m"].is<float>() &&
+        !doc["current"]["temperature_2m"].is<int>()) return;
+    weatherTemp  = doc["current"]["temperature_2m"] | 0.0f;
+    weatherCode  = doc["current"]["weather_code"]   | -1;
+    weatherValid = true;
+    logf("Weather: %.1f C, code %d\n", weatherTemp, weatherCode);
+}
+
+// Weather page (drawn into the global sprite, which the caller pushes).
+void drawWeatherScreen() {
+    char tstr[8];
+    snprintf(tstr, sizeof(tstr), "%.0f", weatherTemp);
+    String temp = String(tstr) + "\xB0";  // degree sign
+    sprite.setTextFont(1);
+    sprite.setTextColor(AMBER, BG_COLOR);
+    sprite.setTextSize(7);
+    int w = sprite.textWidth(temp);
+    drawGlowText(sprite, (SCREEN_W - w) / 2, 35, temp);
+
+    const char* cond = weatherText(weatherCode);
+    sprite.setTextSize(2);
+    sprite.setTextColor(AMBER_DIM, BG_COLOR);
+    int cw = sprite.textWidth(cond);
+    sprite.setCursor((SCREEN_W - cw) / 2, 120);
+    sprite.print(cond);
+
+    sprite.setTextSize(1);
+    const char* loc = "Wien";
+    sprite.setCursor((SCREEN_W - sprite.textWidth(loc)) / 2, 150);
+    sprite.print(loc);
+}
+
 void drawDisplay() {
+    // Standby: panel is asleep, skip all rendering (games keep it awake).
+    if (standbyActive && appMode == MODE_DEPARTURES) return;
+
     sprite.createSprite(SCREEN_W, SCREEN_H);
     sprite.fillSprite(BG_COLOR);
     sprite.setTextFont(1);
@@ -4432,8 +4610,11 @@ void drawDisplay() {
         if (numDepPages < 1) numDepPages = 1;
 
         struct tm clockTi;
-        bool clockReady = cfgShowClock && getLocalTime(&clockTi, 0);
-        int totalPages = numDepPages + (clockReady ? 1 : 0);
+        bool clockReady   = cfgShowClock && getLocalTime(&clockTi, 0);
+        bool weatherReady = cfgShowWeather && weatherValid;
+        int clockPage   = numDepPages;                     // index of clock page (if any)
+        int weatherPage = numDepPages + (clockReady ? 1 : 0); // index of weather page (if any)
+        int totalPages  = numDepPages + (clockReady ? 1 : 0) + (weatherReady ? 1 : 0);
 
         if (totalPages > 1) {
             if (millis() - lastRotateMs > (unsigned long)cfgRotateSec * 1000) {
@@ -4452,8 +4633,16 @@ void drawDisplay() {
         if (dispPage >= totalPages) dispPage = 0;  // config may have changed since last frame
 
         // Clock page: draw and bail (no departure slots involved)
-        if (clockReady && dispPage == numDepPages) {
+        if (clockReady && dispPage == clockPage) {
             drawClockScreen(clockTi);
+            xSemaphoreGive(dataMutex);
+            sprite.pushSprite(0, 0);
+            sprite.deleteSprite();
+            return;
+        }
+        // Weather page: draw and bail
+        if (weatherReady && dispPage == weatherPage) {
+            drawWeatherScreen();
             xSemaphoreGive(dataMutex);
             sprite.pushSprite(0, 0);
             sprite.deleteSprite();
@@ -4732,34 +4921,122 @@ void drawDisplay() {
     sprite.deleteSprite();
 }
 
-// ── Night mode backlight control ─────────────────────────────────────
+// ── Power schedule: night dim + standby (panel off) + deep sleep ─────
 bool lastNightState = false;
+volatile bool standbyActive = false;
+volatile bool powerDirty = false;
 
-void applyNightMode() {
-    if (cfgNightFrom < 0 || cfgNightTo < 0) {
-        // Night mode disabled — ensure day brightness is applied
-        if (lastNightState) {
-            ledcWrite(0, cfgBrightness);
-            lastNightState = false;
-        }
+// ST7789 command opcodes
+static const uint8_t ST_SLPIN  = 0x10;
+static const uint8_t ST_SLPOUT = 0x11;
+static const uint8_t ST_DISPOFF = 0x28;
+static const uint8_t ST_DISPON  = 0x29;
+
+// Deep sleep safety bounds
+static const unsigned long MIN_AWAKE_MS = 90000;     // stay awake ≥90s after boot before deep sleep
+static const long          MIN_SLEEP_S  = 120;       // don't deep-sleep for < 2 min (anti-thrash)
+static const long          MAX_SLEEP_S  = 14L * 3600;// cap at 14h (sanity bound)
+
+// True if hour h falls inside [from, to). from==to or any negative → empty/disabled.
+static bool inWindow(int h, int from, int to) {
+    if (from < 0 || to < 0 || from == to) return false;
+    if (from < to) return (h >= from && h < to);
+    return (h >= from || h < to);  // wraps midnight (e.g. 22–7)
+}
+
+void panelSleep() {
+    ledcWrite(0, 0);
+    tft.writecommand(ST_DISPOFF);
+    tft.writecommand(ST_SLPIN);
+}
+
+void panelWake() {
+    tft.writecommand(ST_SLPOUT);
+    delay(120);
+    tft.writecommand(ST_DISPON);
+}
+
+// Runs in displayTask only (panel SPI commands must not run from another task).
+void applyPowerSchedule() {
+    struct tm ti;
+    if (!getLocalTime(&ti, 0)) {
+        // No valid time yet — make sure the display is on at day brightness.
+        if (standbyActive) { panelWake(); standbyActive = false; }
+        if (lastNightState) { ledcWrite(0, cfgBrightness); lastNightState = false; }
         return;
     }
-    struct tm timeinfo;
-    if (!getLocalTime(&timeinfo, 0)) return;
-    int h = timeinfo.tm_hour;
+    bool we = cfgWeekendSchedule && (ti.tm_wday == 0 || ti.tm_wday == 6);
+    int sFrom = we ? cfgStandbyFromWe : cfgStandbyFrom;
+    int sTo   = we ? cfgStandbyToWe   : cfgStandbyTo;
+    int nFrom = we ? cfgNightFromWe   : cfgNightFrom;
+    int nTo   = we ? cfgNightToWe     : cfgNightTo;
+    int h = ti.tm_hour;
 
-    bool isNight;
-    if (cfgNightFrom <= cfgNightTo) {
-        isNight = (h >= cfgNightFrom && h < cfgNightTo);
-    } else {
-        // Wraps midnight, e.g. 22–07
-        isNight = (h >= cfgNightFrom || h < cfgNightTo);
+    // Standby only applies to the departures view; games keep the screen on.
+    bool standby = (appMode == MODE_DEPARTURES) && inWindow(h, sFrom, sTo);
+
+    if (standby) {
+        if (!standbyActive) { panelSleep(); standbyActive = true; }
+        return;  // deep sleep (if enabled) handled by maybeEnterDeepSleep()
     }
 
-    if (isNight != lastNightState) {
+    // Not in standby → ensure panel awake, then apply night/day brightness.
+    bool justWoke = false;
+    if (standbyActive) { panelWake(); standbyActive = false; justWoke = true; }
+
+    bool isNight = inWindow(h, nFrom, nTo);
+    if (isNight != lastNightState || justWoke) {
         ledcWrite(0, isNight ? cfgNightBright : cfgBrightness);
         lastNightState = isNight;
     }
+}
+
+// EXPERIMENTAL deep sleep. Runs in displayTask. Multiple safety gates guard
+// against boot-loops / making the device unreachable. Never returns if it sleeps.
+void maybeEnterDeepSleep() {
+    if (!cfgStandbyDeepSleep) return;
+    if (appMode != MODE_DEPARTURES) return;
+    if (otaInProgress) return;
+    if (millis() < MIN_AWAKE_MS) return;     // give web server time to come up first
+    struct tm ti;
+    if (!getLocalTime(&ti, 0)) return;       // never deep-sleep without a valid clock
+
+    bool we = cfgWeekendSchedule && (ti.tm_wday == 0 || ti.tm_wday == 6);
+    int sFrom = we ? cfgStandbyFromWe : cfgStandbyFrom;
+    int sTo   = we ? cfgStandbyToWe   : cfgStandbyTo;
+    if (!inWindow(ti.tm_hour, sFrom, sTo)) return;
+
+    // Seconds until the next occurrence of sTo:00:00, + small margin.
+    long nowSec  = ti.tm_hour * 3600L + ti.tm_min * 60L + ti.tm_sec;
+    long delta   = sTo * 3600L - nowSec;
+    if (delta <= 0) delta += 24 * 3600;
+    delta += 30;
+    if (delta < MIN_SLEEP_S) return;         // too close to window end → skip
+    if (delta > MAX_SLEEP_S) delta = MAX_SLEEP_S;
+
+    logf("Deep sleep for %ld s (until %02d:00)\n", delta, sTo);
+
+    // Brief on-device notice so it's clear what happened.
+    sprite.createSprite(SCREEN_W, SCREEN_H);
+    sprite.fillSprite(BG_COLOR);
+    sprite.setTextFont(1);
+    sprite.setTextColor(AMBER, BG_COLOR);
+    sprite.setTextSize(2);
+    char msg[32];
+    snprintf(msg, sizeof(msg), "Deep Sleep bis %02d:00", sTo);
+    sprite.setCursor((SCREEN_W - sprite.textWidth(msg)) / 2, 70);
+    sprite.print(msg);
+    sprite.pushSprite(0, 0);
+    sprite.deleteSprite();
+    delay(1500);
+
+    // Clean shutdown: panel sleep + backlight forced low so it stays dark.
+    panelSleep();
+    pinMode(TFT_BL, OUTPUT);
+    digitalWrite(TFT_BL, LOW);
+
+    esp_sleep_enable_timer_wakeup((uint64_t)delta * 1000000ULL);
+    esp_deep_sleep_start();  // never returns; wakes via full reboot
 }
 
 // ── FreeRTOS tasks ───────────────────────────────────────────────────
@@ -4795,6 +5072,12 @@ void dataTask(void* param) {
         }
         fetchDepartures();
         fetchOebbDepartures();
+        // Weather: only when the page is enabled, throttled (changes slowly)
+        if (cfgShowWeather && (lastWeatherFetch == 0 ||
+                               millis() - lastWeatherFetch > WEATHER_INTERVAL_MS)) {
+            fetchWeather();
+            lastWeatherFetch = millis();
+        }
         // Refresh CSV cache if stale, then rebuild line directions
         if (!isCacheValid()) {
             if (refreshCsvCache(true)) buildLineDirections();
@@ -4825,14 +5108,20 @@ void dataTask(void* param) {
 }
 
 void displayTask(void* param) {
-    unsigned long lastNightCheck = 0;
+    unsigned long lastPowerCheck = 0;
+    AppMode lastMode = appMode;
     for (;;) {
         if (appMode == MODE_PONG)  pongTick();
         if (appMode == MODE_SNAKE) snakeTick();
         drawDisplay();
-        if (millis() - lastNightCheck > 10000) {
-            applyNightMode();
-            lastNightCheck = millis();
+        // Re-evaluate power state on a timer, when config changed, or when the
+        // app mode switched (e.g. a game starts during standby → wake the panel).
+        if (appMode != lastMode) { lastMode = appMode; powerDirty = true; }
+        if (powerDirty || millis() - lastPowerCheck > 10000) {
+            powerDirty = false;
+            applyPowerSchedule();
+            maybeEnterDeepSleep();  // may not return
+            lastPowerCheck = millis();
         }
         vTaskDelay(pdMS_TO_TICKS(50));  // ~20fps for smooth scrolling
     }
