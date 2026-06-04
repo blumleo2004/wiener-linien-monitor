@@ -4,6 +4,11 @@
 
 von Leo Blum
 
+<p align="center">
+  <img src="images/device_stand.png" width="350" alt="LineTracker mit Standfuß" />
+  <img src="images/device_display.png" width="350" alt="LineTracker Display Nahaufnahme" />
+</p>
+
 ---
 
 
